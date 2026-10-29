@@ -4,7 +4,7 @@ Cost-aware prompt routing in **Google ADK (`>= 2.13.0`)** using **TypeSafe's Jev
 
 ## Overview
 
-Traditional LLM routers require a full text-generation round-trip just to decide which downstream model should handle a request. This example ([`adk_model_router/agent.py`](adk_model_router/agent.py)) replaces LLM-based routing with `TypesafeClassifier` (`google.adk.integrations.typesafe`), introduced in `google-adk` **2.13.0**.
+Traditional LLM routers require a full text-generation round-trip just to decide which downstream model should handle a request. This example ([`adk_model_router/agent.py`](adk_model_router/agent.py)) replaces LLM-based routing with `TypesafeClassifier` (`google.adk.integrations.typesafe`) and `ClassifierNode` (`google.adk.labs.classifiers`), introduced in `google-adk` **2.13.0**.
 
 Instead of generating tokens, Jev (`jev-latest`) evaluates a typed `Choice` question (`google.adk.labs.classifiers`) in a **single forward pass** via TypeSafe's `/v1/systemone` API—returning calibrated probabilities, a confidence score, and the selected model tier (`fast` or `powerful`) to branch execution inside a declarative ADK 2.0 `Workflow`.
 
@@ -14,9 +14,9 @@ Instead of generating tokens, Jev (`jev-latest`) evaluates a typed `Choice` ques
 
 ```mermaid
 flowchart TD
-    START(["START"]) --> Router["typesafe_jev_router<br/>TypesafeClassifier (jev-latest)"]
-    Router -- "ctx.route == 'fast'" --> Fast["fast_agent<br/>(gemini-2.5-flash)"]
-    Router -- "ctx.route == 'powerful'" --> Powerful["powerful_agent<br/>(gemini-2.5-pro)"]
+    START(["START"]) --> Router["typesafe_jev_router<br/>ClassifierNode (jev-latest)"]
+    Router -- "fast" --> Fast["fast_agent<br/>(gemini-2.5-flash)"]
+    Router -- "powerful" --> Powerful["powerful_agent<br/>(gemini-2.5-pro)"]
 ```
 
 ### Routing Tiers
@@ -40,26 +40,27 @@ The implementation in [`adk_model_router/agent.py`](adk_model_router/agent.py) i
    - **`fast_agent` (`gemini-2.5-flash`)**: Handles low-latency, low-cost tasks concisely and accurately.
    - **`powerful_agent` (`gemini-2.5-pro`)**: Handles complex architectural design and high-stakes reasoning.
 
-3. **Jev Routing Node (`typesafe_jev_router`)**:
-   - Normalizes the incoming `node_input` (`types.Content` parts, raw string, dictionary, or `ctx.state["prompt"]`) into plain prompt text.
-   - Calls `await classifier.classify(input=prompt_text, questions={"model_tier": ROUTING_QUESTION})`.
-   - Sets `ctx.route = answer.choice` (`"fast"` or `"powerful"`) and records Jev's calibrated telemetry into `ctx.state`.
+3. **Jev Routing Node (`ClassifierNode` as `typesafe_jev_router`)**:
+   - Implements ADK's declarative `ClassifierNode` (`google.adk.labs.classifiers`) configured with `classifier=classifier`, `question=ROUTING_QUESTION`, and `answer_key="jev_routing"`.
+   - Assesses the incoming prompt via Jev in a single forward pass without manual token generation or parsing.
+   - Automatically saves Jev's classification result into session state under `answer_key="jev_routing"`.
+   - Emits the chosen route label (`"fast"` or `"powerful"`) to resolve downstream workflow branching.
 
 4. **Declarative Workflow Graph (`Workflow` & `root_agent`)**:
-   - Wires `START -> typesafe_jev_router_node` with dictionary-based conditional edges (`{"fast": fast_agent, "powerful": powerful_agent}`).
-   - Exposes `root_agent` (re-exported in [`adk_model_router/__init__.py`](adk_model_router/__init__.py)) for ADK CLI and web server discovery.
+   - Defines `agent = Workflow(name="adk_typesafe_model_router_workflow", edges=[(START, typesafe_jev_router, {"fast": fast_agent, "powerful": powerful_agent})])`.
+   - Wires `START -> typesafe_jev_router` with dictionary-based conditional edges mapping Jev's output choices directly to `fast_agent` and `powerful_agent`.
+   - Exposes `root_agent = agent` (re-exported in [`adk_model_router/__init__.py`](adk_model_router/__init__.py)) for ADK CLI (`adk run`) and web server (`adk web`) discovery.
 
 ### Session State Telemetry
 
-On every turn, `typesafe_jev_router_node` persists Jev's decision metadata into `ctx.state` (inspectable in the `adk web` State tab):
+On every turn, `typesafe_jev_router` records Jev's decision metadata into `ctx.state["jev_routing"]` (inspectable in the `adk web` State tab):
 
-| State Key | Type | Description |
+| State Attribute (`ctx.state["jev_routing"]`) | Type | Description |
 | :--- | :--- | :--- |
-| `prompt` | `str` | Normalized user prompt text evaluated by Jev. |
-| `selected_route` | `str` | Chosen route label (`"fast"` or `"powerful"`). |
-| `jev_probabilities` | `dict[str, float]` | Calibrated probability distribution across `"fast"` and `"powerful"`. |
-| `jev_confidence` | `float` or `None` | Confidence score reported by Jev (when available). |
-| `jev_model_version` | `str` or `None` | Concrete Jev model version that `jev-latest` resolved to. |
+| `choice` | `str` | Selected route tier (`"fast"` or `"powerful"`). |
+| `probabilities` | `dict[str, float]` | Calibrated probability distribution across `"fast"` and `"powerful"`. |
+| `confidence` | `float` or `None` | Confidence score reported by Jev for the classification. |
+| Model metadata | `dict` or `str` | Additional System-1 inference metadata returned by Jev `/v1/systemone`. |
 
 ---
 
